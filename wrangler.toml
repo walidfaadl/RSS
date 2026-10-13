@@ -1,0 +1,11 @@
+name = "x-rss-worker"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+
+[vars]
+# مدة التخزين المؤقت بالثواني (كل طلب للـAPI مدفوع — لا تخفّضها كثيراً)
+CACHE_TTL = "900"
+
+# المتغيّرات السرية (لا تضعها هنا):
+#   npx wrangler secret put TWITTERAPI_KEY   ← مفتاح twitterapi.io (إلزامي)
+#   npx wrangler secret put ACCESS_KEY       ← اختياري: يمنع الغرباء من استهلاك رصيدك
