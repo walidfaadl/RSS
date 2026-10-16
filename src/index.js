@@ -366,7 +366,12 @@ function htmlResponse(html) {
   return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
 }
 function opmlResponse(xml) {
-  return new Response(xml, { headers: { "content-type": "text/x-opml; charset=utf-8" } });
+  return new Response(xml, {
+    headers: {
+      "content-type": "text/x-opml; charset=utf-8",
+      "content-disposition": 'attachment; filename="feeds.opml"',
+    },
+  });
 }
 
 function buildOpml(origin, accessKey) {
