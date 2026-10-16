@@ -13,6 +13,13 @@
  *   replies=1    تضمين الردود (افتراضياً: لا)
  *   retweets=0   استبعاد إعادة التغريد (افتراضياً: تُضمَّن)
  *   key=...      مطلوب إذا ضُبط المتغيّر ACCESS_KEY
+ *
+ * أرشفة خلفية (للحسابات، وليس للبحث):
+ *   مشغّل cron (انظر wrangler.toml) يسحب حساباً واحداً فقط كل دورة بالدور من
+ *   ACCOUNT_GROUPS ويخزّن نتيجته في KV (TWEETS_KV). خلاصات /user و/feed للحساب
+ *   تُقرأ من هذا المخزون مباشرة، فلا تصطدم أبداً بحد الـ5 ثوانٍ في twitterapi.io
+ *   حتى لو طلب قارئ RSS عشرات الحسابات دفعة واحدة. حساب لم يُؤرشف بعد يُجلب حياً
+ *   مرة واحدة ويُخزَّن تلقائياً ليصبح جاهزاً من المخزون في المرات القادمة.
  */
 
 const API_BASE = "https://api.twitterapi.io";
@@ -122,21 +129,39 @@ export default {
         retweets: url.searchParams.get("retweets") !== "0",
       };
 
-      // التخزين المؤقت: المفتاح مبني على الهدف والخيارات فقط (بدون key)
+      const selfUrl = new URL(url.origin + path);
+      if (path === "/feed") selfUrl.searchParams.set("url", url.searchParams.get("url"));
+      if (path === "/search") selfUrl.searchParams.set("q", target.value);
+
+      // خلاصات الحسابات تُقرأ من مخزون الأرشفة الخلفية (KV) بدل الجلب الحي —
+      // هذا يمنع اصطدام استيراد عشرات الخلاصات دفعة واحدة بحد الـ5 ثوانٍ.
+      if (target.type === "user") {
+        const { tweets, fetchedAt, fromArchive } = await getUserTweets(target.value, env, ctx);
+        const filtered = filterTweets(tweets, opts);
+        const xml = buildRss(target, filtered, opts, selfUrl.toString());
+        return new Response(xml, {
+          headers: {
+            "content-type": "application/rss+xml; charset=utf-8",
+            "cache-control": "public, max-age=300",
+            "access-control-allow-origin": "*",
+            "x-archived": fromArchive ? "1" : "0",
+            "x-fetched-at": new Date(fetchedAt).toISOString(),
+          },
+        });
+      }
+
+      // البحث: يبقى حياً مع تخزين مؤقت قصير على حافة Cloudflare (ليس جزءاً من الأرشفة بالدور)
       const ttl = parseInt(env.CACHE_TTL || DEFAULT_TTL, 10);
       const cacheKey = new Request(
-        `${url.origin}/__cache/${target.type}/${encodeURIComponent(target.value)}?r=${+opts.replies}&rt=${+opts.retweets}`
+        `${url.origin}/__cache/search/${encodeURIComponent(target.value)}?r=${+opts.replies}&rt=${+opts.retweets}`
       );
       const cache = caches.default;
       const cached = await cache.match(cacheKey);
       if (cached) return cached;
 
-      const selfUrl = new URL(url.origin + path);
-      if (path === "/feed") selfUrl.searchParams.set("url", url.searchParams.get("url"));
-      if (path === "/search") selfUrl.searchParams.set("q", target.value);
-
-      const tweets = await fetchTweets(target, opts, env.TWITTERAPI_KEY);
-      const xml = buildRss(target, tweets, opts, selfUrl.toString());
+      const rawTweets = await fetchTweets(target, env.TWITTERAPI_KEY);
+      const filtered = filterTweets(rawTweets, opts);
+      const xml = buildRss(target, filtered, opts, selfUrl.toString());
 
       const response = new Response(xml, {
         headers: {
@@ -151,7 +176,73 @@ export default {
       return textResponse(`Error: ${err.message}`, 502);
     }
   },
+
+  // مشغّل Cron (انظر crons في wrangler.toml) — يؤرشف حساباً واحداً فقط في كل دورة
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(archiveNextAccount(env));
+  },
 };
+
+/* ------------------------------------------------------------------ */
+/* الأرشفة الخلفية (KV)                                                 */
+/* ------------------------------------------------------------------ */
+
+function allArchivedUsernames() {
+  const seen = new Set();
+  const usernames = [];
+  for (const [, people] of ACCOUNT_GROUPS) {
+    for (const [, username] of people) {
+      const lower = username.toLowerCase();
+      if (!seen.has(lower)) {
+        seen.add(lower);
+        usernames.push(username);
+      }
+    }
+  }
+  return usernames;
+}
+
+async function archiveNextAccount(env) {
+  if (!env.TWITTERAPI_KEY || !env.TWEETS_KV) return;
+  const usernames = allArchivedUsernames();
+  if (!usernames.length) return;
+
+  let cursor = parseInt((await env.TWEETS_KV.get("cursor")) || "0", 10);
+  if (!Number.isFinite(cursor) || cursor < 0) cursor = 0;
+  const username = usernames[cursor % usernames.length];
+
+  try {
+    const tweets = await fetchTweets({ type: "user", value: username }, env.TWITTERAPI_KEY);
+    await env.TWEETS_KV.put(
+      `tw:${username.toLowerCase()}`,
+      JSON.stringify({ tweets, fetchedAt: Date.now() }),
+      { expirationTtl: 60 * 60 * 24 * 7 }
+    );
+  } catch (err) {
+    // لا نحرّك المؤشر عند الفشل، فتُعاد محاولة نفس الحساب في الدورة القادمة
+    console.error(`archive failed for @${username}: ${err.message}`);
+    return;
+  }
+  await env.TWEETS_KV.put("cursor", String(cursor + 1));
+}
+
+async function getUserTweets(username, env, ctx) {
+  const key = `tw:${username.toLowerCase()}`;
+  if (env.TWEETS_KV) {
+    const stored = await env.TWEETS_KV.get(key, "json");
+    if (stored) return { tweets: stored.tweets, fetchedAt: stored.fetchedAt, fromArchive: true };
+  }
+  // لم يُؤرشف بعد (أول طلب لحساب غير موجود في ACCOUNT_GROUPS مثلاً) — نجلبه حياً
+  // مرة واحدة ونخزّنه، فيصبح جاهزاً من المخزون في المرات القادمة.
+  const tweets = await fetchTweets({ type: "user", value: username }, env.TWITTERAPI_KEY);
+  const fetchedAt = Date.now();
+  if (env.TWEETS_KV) {
+    ctx.waitUntil(
+      env.TWEETS_KV.put(key, JSON.stringify({ tweets, fetchedAt }), { expirationTtl: 60 * 60 * 24 * 7 })
+    );
+  }
+  return { tweets, fetchedAt, fromArchive: false };
+}
 
 /* ------------------------------------------------------------------ */
 /* تحليل روابط إكس                                                      */
@@ -193,12 +284,14 @@ export function parseXUrl(input) {
 /* جلب التغريدات                                                        */
 /* ------------------------------------------------------------------ */
 
-async function fetchTweets(target, opts, apiKey) {
+async function fetchTweets(target, apiKey) {
   let endpoint;
   if (target.type === "user") {
     endpoint = new URL(API_BASE + "/twitter/user/last_tweets");
     endpoint.searchParams.set("userName", target.value);
-    if (opts.replies) endpoint.searchParams.set("includeReplies", "true");
+    // نجلب الردود دائماً هنا؛ تُستبعد لاحقاً وقت العرض حسب opts.replies — هذا يسمح
+    // بتخزين نسخة كاملة واحدة في الأرشيف تصلح لأي خيارات عرض لاحقة دون إعادة جلب.
+    endpoint.searchParams.set("includeReplies", "true");
   } else {
     endpoint = new URL(API_BASE + "/twitter/tweet/advanced_search");
     endpoint.searchParams.set("query", target.value);
@@ -228,10 +321,14 @@ async function fetchTweets(target, opts, apiKey) {
   if (data.status === "error") throw new Error(`twitterapi.io: ${data.message || data.msg || "unknown error"}`);
 
   // الاستجابة قد تأتي في tweets أو data.tweets — نتعامل مع الحالتين
-  let tweets = data.tweets || (data.data && data.data.tweets) || [];
-  if (!opts.replies) tweets = tweets.filter((t) => !t.isReply);
-  if (!opts.retweets) tweets = tweets.filter((t) => !t.retweeted_tweet);
-  return tweets;
+  return data.tweets || (data.data && data.data.tweets) || [];
+}
+
+function filterTweets(tweets, opts) {
+  let out = tweets;
+  if (!opts.replies) out = out.filter((t) => !t.isReply);
+  if (!opts.retweets) out = out.filter((t) => !t.retweeted_tweet);
+  return out;
 }
 
 /* ------------------------------------------------------------------ */
