@@ -205,8 +205,18 @@ async function fetchTweets(target, opts, apiKey) {
     endpoint.searchParams.set("queryType", "Latest");
   }
 
-  const res = await fetch(endpoint.toString(), { headers: { "X-API-Key": apiKey } });
-  const body = await res.text();
+  // الخطة المجانية في twitterapi.io تسمح بطلب واحد كل 5 ثوانٍ فقط — عند استيراد
+  // عدة خلاصات دفعة واحدة (OPML) تصل الطلبات متزامنة تقريباً فتُرفض بـ429،
+  // لذا نعيد المحاولة مع انتظار كافٍ بدل الفشل فوراً.
+  const MAX_ATTEMPTS = 4;
+  const RETRY_DELAY_MS = 6000;
+  let res, body;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    res = await fetch(endpoint.toString(), { headers: { "X-API-Key": apiKey } });
+    body = await res.text();
+    if (res.status !== 429 || attempt === MAX_ATTEMPTS) break;
+    await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+  }
   if (!res.ok) throw new Error(`twitterapi.io HTTP ${res.status}: ${body.slice(0, 200)}`);
 
   let data;
