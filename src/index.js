@@ -7,6 +7,7 @@
  *   GET /user/<username>          خلاصة حساب
  *   GET /search?q=<query>         خلاصة بحث (صيغة البحث المتقدم في إكس)
  *   GET /feed?url=<x.com link>    الصق رابط إكس مباشرة (حساب أو بحث)
+ *   GET /opml                     ملف OPML لقائمة الحسابات في ACCOUNT_GROUPS أدناه
  *
  * خيارات (Query):
  *   replies=1    تضمين الردود (افتراضياً: لا)
@@ -16,6 +17,66 @@
 
 const API_BASE = "https://api.twitterapi.io";
 const DEFAULT_TTL = 900; // ثوانٍ — كل طلب للـAPI مدفوع، لذا نخزّن مؤقتاً
+
+// قائمة حسابات /opml — عدّلها وأعد النشر (npx wrangler deploy) لتحديث الملف
+const ACCOUNT_GROUPS = [
+  ["صحفيون", [
+    ["باسل عدرا", "basel_adra"],
+    ["مريم البرغوثي", "MariamBarghouti"],
+    ["فادي قرآن", "fadiquran"],
+  ]],
+  ["غزة", [
+    ["هند الخضري", "Hind_Gaza"],
+    ["بليستيا العقاد", "PlestiaAlaqad"],
+    ["مصعب أبو توها", "MosabAbuToha"],
+    ["أحمد النعوق", "AhmedNaouq"],
+    ["محمد شحادة", "muhammadshehad2"],
+  ]],
+  ["سياسيون وحقوقيون", [
+    ["مصطفى البرغوثي", "MustafaBarghoti"],
+    ["حنان عشراوي", "DrHananAshrawi"],
+    ["ديانا بطو", "dianabuttu"],
+    ["نورة عريقات", "4noura"],
+  ]],
+  ["الشتات", [
+    ["علي أبونعمة", "AliAbunimah"],
+    ["رمزي بارود", "RamzyBaroud"],
+    ["سوزان أبو الهوى", "susanabulhawa"],
+    ["طارق بقعوني", "tareqbaconi"],
+    ["يارا هواري", "YaraHawari"],
+  ]],
+  ["معلّقون بالعربية", [
+    ["ياسر الزعاترة", "YZaatreh"],
+    ["تامر المسحال", "tameralmisshal"],
+    ["نور عودة", "nour_odeh"],
+  ]],
+  ["محللون ومعلّقون سياسيون", [
+    ["سعيد زياد", "saeedziad"],
+    ["خالد صافي", "KhaledSafi"],
+    ["أدهم أبو سلمية", "AdhamSelmiya"],
+    ["إبراهيم المدهون", "eb78m"],
+    ["مصطفى الصواف", "MostafaElsawaf"],
+    ["د. فايز أبو شمالة", "FayezShamm18239"],
+  ]],
+  ["صحفيون ومراسلون ميدانيون", [
+    ["وائل الدحدوح", "WaelDahdouh"],
+    ["هشام زقوت", "hishamzaqout"],
+    ["يوسف فارس", "Yusuf198989"],
+    ["إسلام بدر", "islambader_1988"],
+    ["أحمد حمدان", "AHM3D_HAMDAN"],
+    ["معتصم دلول", "AbujomaaGaza"],
+    ["علي جاد الله", "alijadallah66"],
+    ["محمود بصل", "mahmoadbasal"],
+  ]],
+  ["أصوات غزة بالإنجليزية", [
+    ["أبو بكر عابد", "AbubakerAbedW"],
+    ["هند الخضري", "Hind_Gaza"],
+    ["بليستيا العقاد", "PlestiaAlaqad"],
+    ["مصعب أبو توها", "MosabAbuToha"],
+    ["أحمد النعوق", "AhmedNaouq"],
+    ["محمد شحادة", "muhammadshehad2"],
+  ]],
+];
 
 export default {
   async fetch(request, env, ctx) {
@@ -29,6 +90,11 @@ export default {
       if (env.ACCESS_KEY && url.searchParams.get("key") !== env.ACCESS_KEY) {
         return textResponse("Unauthorized: missing or wrong ?key=", 401);
       }
+
+      if (path === "/opml") {
+        return opmlResponse(buildOpml(url.origin, env.ACCESS_KEY || ""));
+      }
+
       if (!env.TWITTERAPI_KEY) {
         return textResponse("Server misconfigured: TWITTERAPI_KEY secret is not set", 500);
       }
@@ -298,6 +364,31 @@ function textResponse(msg, status) {
 }
 function htmlResponse(html) {
   return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
+}
+function opmlResponse(xml) {
+  return new Response(xml, { headers: { "content-type": "text/x-opml; charset=utf-8" } });
+}
+
+function buildOpml(origin, accessKey) {
+  const outlines = ACCOUNT_GROUPS.map(([group, people]) => {
+    const items = people.map(([name, username]) => {
+      const feedUrl = new URL(`${origin}/feed`);
+      feedUrl.searchParams.set("url", `https://x.com/${username}`);
+      if (accessKey) feedUrl.searchParams.set("key", accessKey);
+      return `      <outline text="${esc(name)}" title="${esc(name)}" type="rss" xmlUrl="${esc(feedUrl.toString())}" htmlUrl="${esc(`https://x.com/${username}`)}"/>`;
+    }).join("\n");
+    return `    <outline text="${esc(group)}" title="${esc(group)}">\n${items}\n    </outline>`;
+  }).join("\n");
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<opml version="2.0">
+  <head>
+    <title>x-rss-worker feeds</title>
+  </head>
+  <body>
+${outlines}
+  </body>
+</opml>`;
 }
 
 /* ------------------------------------------------------------------ */
